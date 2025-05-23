@@ -1,362 +1,466 @@
 import collections
 import math
-from zxcvbn import zxcvbn
-import numpy as np # For threshold generation
+import zxcvbn
+import numpy as np # For AUC calculation
 
-# --- MarkovModel Class (from previous version, adapted for n=4 and minor improvements) ---
+# --- MarkovPasswordModel Class ---
 class MarkovPasswordModel:
-    def __init__(self, n=4): # Changed to n=4 as per paper
+    """
+    A character-level n-gram Markov model for password strength assessment.
+    """
+    def __init__(self, n=4, k=1):
+        """
+        Initializes the Markov model.
+        Args:
+            n (int): The order of the n-gram model (e.g., 4 for 4-grams).
+            k (int): The Laplace smoothing constant (add-k smoothing).
+        """
+        if n < 2:
+            raise ValueError("n must be at least 2 for n-grams.")
         self.n = n
-        self.transitions = collections.defaultdict(collections.Counter)
-        self.char_counts = collections.Counter() # Used for vocab size in smoothing
-        self.vocab = set()
+        self.k = k  # Laplace smoothing constant
+        self.transitions = collections.defaultdict(lambda: collections.defaultdict(int))
+        self.prefix_totals = collections.defaultdict(int)
+        self.vocabulary = set()
+        self.start_token = '^'
+        self.end_token = '$'
+        self.trained = False
 
-    def train(self, passwords):
-        if not passwords:
-            print("Warning: No passwords provided for training.")
+    def _pad_password(self, password):
+        """Pads password with start and end tokens."""
+        # Pad with n-1 start tokens
+        return (self.start_token * (self.n - 1)) + password + self.end_token
+
+    def train(self, passwords_list):
+        """
+        Trains the Markov model on a list of passwords.
+        Args:
+            passwords_list (list): A list of password strings.
+        """
+        if not passwords_list:
+            print("Warning: Training with an empty password list.")
             return
 
-        for password in passwords:
-            if not password:
+        for password in passwords_list:
+            if not isinstance(password, str):
+                print(f"Warning: Skipping non-string item in password list: {password}")
                 continue
             
-            # Add all unique characters from passwords to vocab
-            for char in password:
-                self.vocab.add(char)
+            padded_password = self._pad_password(password)
+            self.vocabulary.update(set(padded_password))
 
-            padded_password = '^' * (self.n - 1) + password + '$' # Start/end markers
-
-            for i in range(len(padded_password) - self.n + 1):
-                gram = padded_password[i : i + self.n]
-                prefix = gram[:-1]
-                next_char = gram[-1]
+            for i in range(len(padded_password) - (self.n - 1)):
+                prefix = padded_password[i : i + self.n - 1]
+                next_char = padded_password[i + self.n - 1]
                 
                 self.transitions[prefix][next_char] += 1
-                self.char_counts[next_char] += 1 # Count all chars for smoothing
+                self.prefix_totals[prefix] += 1
         
-        # Add special tokens to vocab if they were used in padding
-        self.vocab.add('^')
-        self.vocab.add('$')
-        
-        if not self.vocab:
-            print("Warning: Vocabulary is empty after training. Model might not work correctly.")
+        self.trained = True
+        # Add special tokens to vocabulary if not present
+        self.vocabulary.add(self.start_token)
+        self.vocabulary.add(self.end_token)
 
 
-    def get_log_likelihood(self, password, smoothing_k=1):
-        if not self.vocab: # Check if model was trained / vocab exists
-            # print("Warning: Model vocabulary is empty. Returning -inf log-likelihood.")
+    def get_log_likelihood(self, password):
+        """
+        Computes the log-likelihood of a given password under the model.
+        A higher log-likelihood (closer to 0) means a weaker password.
+        Args:
+            password (str): The password string to score.
+        Returns:
+            float: The log-likelihood of the password. Returns -float('inf')
+                   if the model is untrained or vocabulary is empty.
+        """
+        if not self.trained or not self.vocabulary:
+            # print("Warning: Model is not trained or vocabulary is empty. Returning -inf.")
             return -float('inf')
 
-        if not password:
-            return -float('inf')
+        if not isinstance(password, str):
+             # print(f"Warning: Input password is not a string: {password}. Returning -inf.")
+             return -float('inf')
 
+        padded_password = self._pad_password(password)
         log_likelihood = 0.0
-        padded_password = '^' * (self.n - 1) + password + '$'
+        vocab_size = len(self.vocabulary)
 
-        for i in range(len(padded_password) - self.n + 1):
-            gram = padded_password[i : i + self.n]
-            prefix = gram[:-1]
-            next_char = gram[-1]
+        for i in range(len(padded_password) - (self.n - 1)):
+            prefix = padded_password[i : i + self.n - 1]
+            next_char = padded_password[i + self.n - 1]
 
-            prefix_total_transitions = sum(self.transitions[prefix].values())
-            char_transition_count = self.transitions[prefix][next_char]
+            count_prefix_next_char = self.transitions[prefix].get(next_char, 0)
+            count_prefix_total = self.prefix_totals.get(prefix, 0)
+
+            # Laplace smoothing (add-k)
+            prob = (count_prefix_next_char + self.k) / (count_prefix_total + self.k * vocab_size)
             
-            # Laplace smoothing
-            prob = (char_transition_count + smoothing_k) / (prefix_total_transitions + smoothing_k * len(self.vocab))
+            if prob == 0: # Should not happen with k > 0 if vocab_size > 0
+                log_likelihood = -float('inf')
+                break 
+            log_likelihood += math.log(prob)
             
-            if prob > 0:
-                log_likelihood += math.log(prob)
-            else:
-                log_likelihood += -float('inf') 
         return log_likelihood
 
-# --- New functions for metrics and experiments ---
+# --- Helper Functions ---
+def get_zxcvbn_details(password):
+    """
+    Gets zxcvbn score and a weak/strong label for a password.
+    Args:
+        password (str): The password to evaluate.
+    Returns:
+        tuple: (zxcvbn_score (0-4), is_weak (bool: True if score < 3))
+    """
+    if not isinstance(password, str): # Handle non-string inputs gracefully
+        return -1, True # Or raise an error, depending on desired behavior
+    results = zxcvbn.zxcvbn(password)
+    score = results['score']
+    is_weak = score < 3  # 0, 1, 2 are weak; 3, 4 are strong
+    return score, is_weak
 
-def get_zxcvbn_labels(passwords_data):
-    """ Get 'weak' (True) or 'strong' (False) labels from zxcvbn """
-    labels = []
-    scores = []
-    for pwd_data in passwords_data:
-        # Assuming pwd_data can be a simple string or a dict with 'password' key
-        pwd = pwd_data if isinstance(pwd_data, str) else pwd_data['password']
-        z_score = zxcvbn(pwd)['score']
-        scores.append(z_score)
-        labels.append(z_score < 3) # True if weak (score 0, 1, 2)
-    return np.array(labels), np.array(scores)
+def calculate_classification_metrics(true_labels, pred_scores, threshold):
+    """
+    Calculates Precision, Recall, and F1-score.
+    Args:
+        true_labels (list): List of true boolean labels (True for weak).
+        pred_scores (list): List of Markov log-likelihood scores.
+        threshold (float): Markov score threshold to classify as weak.
+                           (score > threshold is predicted weak).
+    Returns:
+        tuple: (precision, recall, f1_score)
+    """
+    tp, fp, tn, fn = 0, 0, 0, 0
+    for true_label, score in zip(true_labels, pred_scores):
+        predicted_weak = score > threshold
+        if predicted_weak and true_label:
+            tp += 1
+        elif predicted_weak and not true_label:
+            fp += 1
+        elif not predicted_weak and not true_label:
+            tn += 1
+        elif not predicted_weak and true_label:
+            fn += 1
 
-def calculate_prf1(y_true, y_pred_scores, threshold):
-    """ Calculates Precision, Recall, F1 for Markov model predictions """
-    # Markov: higher log-likelihood (less negative) is weaker.
-    # So, if score > threshold, predict as weak.
-    y_pred_binary = y_pred_scores > threshold 
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    return precision, recall, f1_score
 
-    tp = np.sum((y_pred_binary == True) & (y_true == True))
-    fp = np.sum((y_pred_binary == True) & (y_true == False))
-    fn = np.sum((y_pred_binary == False) & (y_true == True))
-    tn = np.sum((y_pred_binary == False) & (y_true == False))
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0 # Same as TPR
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+def get_roc_pr_data(true_labels, pred_scores):
+    """
+    Generates data points for ROC and PR curves and calculates AUC for ROC.
+    Args:
+        true_labels (list): List of true boolean labels (True for weak/positive).
+        pred_scores (list): List of prediction scores (higher score = more likely positive/weak).
+    Returns:
+        tuple: (roc_points, auc, pr_points)
+               roc_points: list of (FPR, TPR) tuples
+               auc: Area Under ROC Curve
+               pr_points: list of (Recall, Precision) tuples
+    """
+    # Sort by prediction score in descending order
+    # If scores are log-likelihoods, higher means weaker, so this is correct for "weak" as positive
+    combined = sorted(zip(pred_scores, true_labels), key=lambda x: x[0], reverse=True)
     
-    tpr = recall # True Positive Rate
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0 # False Positive Rate
+    roc_points = []
+    pr_points = []
     
-    return precision, recall, f1, tpr, fpr
+    total_positives = sum(true_labels)
+    total_negatives = len(true_labels) - total_positives
 
-def generate_roc_pr_data(y_true, markov_scores_for_roc):
-    """ Generates data points for ROC and PR curves """
-    # Markov scores are log-likelihoods; more negative = stronger.
-    # For ROC/PR, we need to vary a threshold.
-    # Let's test thresholds across the range of observed Markov scores.
-    # Lower scores (more negative) should correspond to "strong" predictions.
-    # Higher scores (less negative) should correspond to "weak" predictions.
+    if total_positives == 0 or total_negatives == 0: # Cannot compute ROC/PR if only one class present
+        # print("Warning: Only one class present in true_labels. ROC/PR/AUC cannot be computed meaningfully.")
+        return [(0,0), (1,1)], 0.5, [(0,1), (1,0)] if total_positives > 0 else [(0,0),(1,0)]
+
+
+    tp, fp = 0, 0
     
-    # Sort scores to define thresholds: unique sorted log-likelihoods
-    # Thresholds will be applied such that if markov_score > threshold, it's predicted weak.
-    thresholds = sorted(list(set(markov_scores_for_roc))) 
-    if not thresholds: return [], []
+    # Add a point for the beginning of the curve
+    roc_points.append((0.0, 0.0))
+    # For PR curve, initial point depends on the first threshold.
+    # Typically, PR curve starts from (Recall=0, Precision=1) if the highest score is a TP.
+    # Or (Recall=0, Precision= undefined/0) if highest score is FP.
+    # Let's calculate it dynamically.
 
-    # Add a value slightly above max and below min to ensure full curve range
-    if thresholds:
-        thresholds = np.concatenate(([thresholds[0] - 1], thresholds, [thresholds[-1] + 1]))
-    else: # only one unique score or empty
-        thresholds = np.array([np.min(markov_scores_for_roc) -1, np.max(markov_scores_for_roc) + 1])
+    last_score = -float('inf')
+
+    for i in range(len(combined)):
+        score, true_label = combined[i]
+
+        if score != last_score: # Only update points when threshold changes
+            if total_negatives > 0:
+                fpr = fp / total_negatives
+            else: # Should be caught by earlier check
+                fpr = 0 
+            
+            if total_positives > 0:
+                tpr = tp / total_positives # Recall
+            else: # Should be caught by earlier check
+                tpr = 0
+            
+            roc_points.append((fpr, tpr))
+
+            if (tp + fp) > 0:
+                precision = tp / (tp + fp)
+                pr_points.append((tpr, precision)) # (Recall, Precision)
+            elif tp == 0 and total_positives > 0: # No predictions made yet, or all false
+                 pr_points.append((tpr, 0.0))
 
 
-    roc_points = [] # (fpr, tpr)
-    pr_points = []  # (recall, precision)
+            last_score = score
 
-    for thresh in thresholds:
-        # Predict weak if markov_score > thresh
-        # (because higher log-likelihood means weaker according to model)
-        y_pred_roc = markov_scores_for_roc > thresh
-        
-        tp = np.sum((y_pred_roc == True) & (y_true == True))
-        fp = np.sum((y_pred_roc == True) & (y_true == False))
-        fn = np.sum((y_pred_roc == False) & (y_true == True))
-        tn = np.sum((y_pred_roc == False) & (y_true == False))
+        if true_label: # Positive
+            tp += 1
+        else: # Negative
+            fp += 1
 
-        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
-        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0 # Handle division by zero
-        recall = tpr
-
-        roc_points.append((fpr, tpr))
-        # For PR curve, typically precision is on y-axis, recall on x-axis
-        # Only add point if precision or recall is non-zero to avoid cluttering (0,0)
-        if recall > 0 or precision > 0:
-             pr_points.append((recall, precision))
-
-    # Sort for plotting: ROC by FPR, PR by Recall
-    roc_points.sort(key=lambda x: x[0])
-    pr_points.sort(key=lambda x: x[0])
+    # Add a point for the end of the curve
+    if total_negatives > 0:
+        fpr = fp / total_negatives
+    else:
+        fpr = 1.0 # Effectively
     
-    # Ensure (0,0) and (1,1) for ROC, and potentially (0, value) and (1, value) for PR
-    if not any(p[0] == 0 and p[1] == 0 for p in roc_points):
-        roc_points.insert(0, (0.0, 0.0))
-    if not any(p[0] == 1 and p[1] == 1 for p in roc_points):
-        roc_points.append((1.0, 1.0))
+    if total_positives > 0:
+        tpr = tp / total_positives
+    else:
+        tpr = 1.0 # Effectively
 
-    # Remove duplicate points for cleaner plotting data
+    roc_points.append((fpr, tpr)) # Should be (1,1) if all points processed
+
+    if (tp + fp) > 0 :
+        precision = tp / (tp + fp)
+        pr_points.append((tpr, precision))
+    elif tp == 0 and total_positives > 0:
+        pr_points.append((tpr,0.0))
+    else: # Handle case where no positives exist or no TPs were found.
+        pr_points.append((1.0, 0.0 if total_positives > 0 else 1.0))
+
+
+    # Remove duplicate points for cleaner curves
     roc_points = sorted(list(set(roc_points)))
     pr_points = sorted(list(set(pr_points)))
-    if not pr_points or pr_points[0] != (0.0, pr_points[0][1] if pr_points else 1.0): # Start PR curve from recall=0
-        # Find precision at recall=0 (usually 1.0 if any positives exist, or based on first point)
-        # This is a bit heuristic for PR curve start.
-        # A common convention is to extend to (0, p_at_first_recall_point)
-        pass # Plotting libraries usually handle this.
-
-    return roc_points, pr_points
 
 
-def approximate_guess_rank(markov_model, training_passwords, test_passwords_list):
-    """ Approximates guess rank for test passwords """
-    print("\n--- Approximate Guess Rank ---")
-    print("Note: Based on sorting all training + test passwords by Markov log-likelihood.")
-    print("Lower rank (closer to 1) means model finds it weaker/more guessable.\n")
-
-    all_passwords_for_ranking = list(set(training_passwords + test_passwords_list))
+    # Calculate AUC using trapezoidal rule
+    auc = 0.0
+    if len(roc_points) > 1:
+        # Ensure roc_points are sorted by FPR
+        roc_points.sort(key=lambda x: x[0])
+        for i in range(len(roc_points) - 1):
+            auc += (roc_points[i+1][0] - roc_points[i][0]) * (roc_points[i+1][1] + roc_points[i][1]) / 2.0
     
+    return roc_points, auc, pr_points
+
+def approximate_guess_rank(model, all_passwords, test_passwords_to_rank):
+    """
+    Computes approximate guess rank for specified test passwords.
+    Args:
+        model: The trained MarkovPasswordModel.
+        all_passwords (list): A list of all passwords (training + test) to rank.
+        test_passwords_to_rank (list): A sublist of passwords whose ranks are desired.
+    Returns:
+        list: A list of tuples (password, rank, log_likelihood).
+    """
     scored_passwords = []
-    for pwd in all_passwords_for_ranking:
-        score = markov_model.get_log_likelihood(pwd)
-        scored_passwords.append({'password': pwd, 'markov_score': score})
-    
-    # Sort by Markov score (ascending log-likelihood means weaker is ranked higher, so we sort descending for rank)
-    # No, ascending log-likelihood (less negative) means weaker. So sort ascending.
-    # Rank 1 is the weakest.
-    scored_passwords.sort(key=lambda x: x['markov_score'], reverse=False) # Weakest first (higher log-likelihood)
+    for p in all_passwords:
+        if isinstance(p, str): # ensure it's a string
+            scored_passwords.append((p, model.get_log_likelihood(p)))
 
-    ranks = {}
-    for i, item in enumerate(scored_passwords):
-        if item['password'] in test_passwords_list:
-            ranks[item['password']] = {
-                'rank': i + 1, 
-                'markov_score': item['markov_score'],
-                'total_evaluated_for_rank': len(scored_passwords)
-            }
-            
-    print(f"{'Test Password':<30} | {'Approx. Guess Rank':<20} | {'Markov LogLikelihood':<20}")
-    print("-" * 70)
-    for pwd in test_passwords_list:
-        if pwd in ranks:
-            print(f"{pwd:<30} | {ranks[pwd]['rank']:<20} | {ranks[pwd]['markov_score']:<20.4f}")
-        else:
-            print(f"{pwd:<30} | {'Not found in ranking set':<20} | {'N/A':<20}")
-    print(f"Total passwords considered for ranking: {len(scored_passwords)}")
+    # Sort by log-likelihood (descending: higher score = weaker = earlier guess)
+    scored_passwords.sort(key=lambda x: x[1], reverse=True)
+
+    ranks = []
+    for p_test in test_passwords_to_rank:
+        if not isinstance(p_test, str): continue
+        found = False
+        for i, (p_ranked, score) in enumerate(scored_passwords):
+            if p_test == p_ranked:
+                ranks.append((p_test, i + 1, score)) # Rank is 1-indexed
+                found = True
+                break
+        if not found: # Should not happen if test_passwords_to_rank is subset of all_passwords
+            ranks.append((p_test, -1, model.get_log_likelihood(p_test))) # Or handle as error
     return ranks
 
+def run_policy_experiments(model, zxcvbn_func):
+    """
+    Runs 'what-if' experiments for password policy transformations.
+    Args:
+        model: The trained MarkovPasswordModel.
+        zxcvbn_func: Function to get zxcvbn score (e.g., lambda p: get_zxcvbn_details(p)[0]).
+    """
+    print("--- Password Policy Experiments ---")
+    print(f"{'Policy':<30} | {'Variation':<15} | {'Password':<25} | {'Markov LogLik (n=4)':<20} | {'zxcvbn Score':<15}")
+    print("-" * 120)
 
-def run_policy_experiments(markov_model):
-    """ Runs simple password policy experiments """
-    print("\n--- Password Policy Experiments ---")
-    
-    policies = {
+    experiments = {
         "Length Increase": [
             ("base", "apple"),
             ("base+1", "apple1"),
             ("base+2", "apple12"),
             ("base+3", "apple123"),
-            ("base+long", "appleorangebanana"),
+            ("base+long", "appleorangebanana")
         ],
         "Symbol Inclusion / Substitution": [
             ("plain", "password"),
             ("capitalized", "Password"),
             ("leet_simple", "P@ssword"),
-            ("leet_complex", "P@$$wOrd"),
-            ("with_symbols", "password!@#"),
+            ("leet_complex", "P@$$wOrd"), # From report
+            ("with_symbols", "password!@#")
         ]
     }
 
-    print(f"{'Policy':<25} | {'Variation':<20} | {'Password':<25} | {'Markov LogLik (n=4)':<20} | {'zxcvbn Score':<15}")
-    print("-" * 110)
-
-    for policy_name, variations in policies.items():
-        for variation_name, pwd_to_test in variations:
-            m_score = markov_model.get_log_likelihood(pwd_to_test)
-            z_results = zxcvbn(pwd_to_test)
-            z_score = z_results['score']
-            print(f"{policy_name:<25} | {variation_name:<20} | {pwd_to_test:<25} | {m_score:<20.4f} | {z_score:<15}")
-        print("-" * 110)
+    for policy_name, variations in experiments.items():
+        for variation_name, pwd in variations:
+            if not isinstance(pwd, str): continue
+            markov_score = model.get_log_likelihood(pwd)
+            z_score, _ = zxcvbn_func(pwd)
+            print(f"{policy_name:<30} | {variation_name:<15} | {pwd:<25} | {markov_score:<20.4f} | {z_score:<15}")
+        print("-" * 120)
 
 # --- Main Demo Function ---
 def run_demo(password_file_path):
-    passwords_for_training = []
-    try:
-        with open(password_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                passwords_for_training.append(line.strip())
-    except FileNotFoundError:
-        print(f"Error: Training password file not found at {password_file_path}")
-        return
-
-    print("="*70)
+    """
+    Orchestrates the entire demo.
+    """
+    print("=" * 70)
     print("Machine Learning for Password Strength: Markov Model Demo (n=4)")
-    print("="*70)
+    print("=" * 70)
     print("IMPORTANT NOTE:")
     print("This demo uses a VERY SMALL training dataset for illustrative purposes.")
-    print(f"({len(passwords_for_training)} passwords from {password_file_path}).")
-    print("Results (AUC, P/R/F1, ranks) are illustrative for this small dataset and WILL NOT match")
-    print("claims made for models trained on large datasets (e.g., 70k RockYou samples).")
-    print("The primary purpose is to demonstrate the *methodology*.")
-    print("="*70 + "\n")
 
-    # Initialize and train the Markov model (n=4)
-    markov_model = MarkovPasswordModel(n=4)
-    markov_model.train(passwords_for_training)
-    print(f"Model training complete. Vocabulary size: {len(markov_model.vocab)}\n")
+    # 1. Model Training
+    try:
+        with open(password_file_path, 'r', encoding='utf-8') as f:
+            # Filter out empty lines and strip whitespace
+            training_passwords = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(f"Error: Password file '{password_file_path}' not found.")
+        print("Please create 'sample_passwords.txt' or specify the correct path.")
+        # Fallback to a small embedded list for demo purposes if file not found
+        training_passwords = [
+            "123456", "password", "qwerty", "admin", "P@$$wOrd", "apple", "secret123",
+            "dragon", "sunshine", "!!@@##$$", "asdfghjkl", "zzzzzzzz", 
+            "ThisIsALongPassword12345", "KeyboardWalk!@#$asdfghjkl", "MyP@sswordIsVerySecure",
+            "P@$$word", # as in report
+            "complexP@ss!", "anotherOne", "testtest", "user123", "Spring2024",
+            "football", "shadow", "monkey", "cheese", "remember", "master"
+        ]
+        print(f"Using a fallback list of {len(training_passwords)} passwords for training.")
+        
+    print(f"({len(training_passwords)} passwords from {password_file_path if 'f' in locals() else 'fallback list'}).")
 
-    # Test passwords for general evaluation
+    markov_model = MarkovPasswordModel(n=4, k=1)
+    markov_model.train(training_passwords)
+    print(f"Model training complete. Vocabulary size: {len(markov_model.vocabulary)}")
+
+    # 2. Basic Scoring Comparison
+    print("\n--- Basic Password Scoring (Markov vs. zxcvbn) ---")
+    print(f"{'Password':<28} | {'Markov LogLik (n=4)':<20} | {'zxcvbn Score':<15} | {'zxcvbn Weak':<10}")
+    print("-" * 82)
+    
     test_passwords_eval = [
         "123456", "password", "qwerty", "admin",
-        "P@$$wOrd", "Str0ngP@sswOrd!", "secret123",
-        "dragon", "sunshine", "!!@@##$$",
-        "asdfghjkl", "zzzzzzzz", 
-        "ThisIsALongPassword12345", "KeyboardWalk!@#$asdfghjkl",
-        "MyP@ssw0rdIsVerySecure" 
+        "P@$$wOrd", # Report uses P@$$wOrd (capital O)
+        "StrongP@ssword!", "secret123", "dragon", "sunshine",
+        "!!@@##$$", "asdfghjkl", "zzzzzzzz",
+        "ThisIsALongPassword12345",
+        "KeyboardWalk!@#$asdfghjkl", # From report
+        "MyP@sswordIsVerySecure" # Report example typo: MyP@ssw0rdIsVerySecure, using report's table version
     ]
-    if not test_passwords_eval:
-        print("No test passwords for evaluation.")
-        return
+    # Add some more diverse cases
+    test_passwords_eval.extend([
+        "apple", "orange123", "Complex!", "verystrongandlongpassword", "111111", "abcdef"
+    ])
+    test_passwords_eval = sorted(list(set(test_passwords_eval + training_passwords[:5]))) # include some training for varied scores
 
-    print("--- Basic Password Scoring (Markov vs. zxcvbn) ---")
-    print(f"{'Password':<30} | {'Markov LogLik (n=4)':<20} | {'zxcvbn Score':<15}")
-    print("-" * 70)
-    
-    markov_scores_all_test = []
+
+    zxcvbn_true_labels_weak = [] # True if zxcvbn score < 3
+    markov_pred_scores = []
+
     for pwd in test_passwords_eval:
+        if not isinstance(pwd, str): continue
         m_score = markov_model.get_log_likelihood(pwd)
-        markov_scores_all_test.append(m_score)
-        z_results = zxcvbn(pwd)
-        z_score = z_results['score']
-        print(f"{pwd:<30} | {m_score:<20.4f} | {z_score:<15}")
-    print("-" * 70)
-    markov_scores_all_test = np.array(markov_scores_all_test)
+        z_score, z_weak = get_zxcvbn_details(pwd)
+        print(f"{pwd:<28} | {m_score:<20.4f} | {z_score:<15} | {str(z_weak):<10}")
+        zxcvbn_true_labels_weak.append(z_weak)
+        markov_pred_scores.append(m_score)
+    print("-" * 82)
 
-    # --- P/R/F1, ROC, PR Data ---
-    # Get zxcvbn labels (True for weak, False for strong) for the test set
-    y_true_labels, _ = get_zxcvbn_labels(test_passwords_eval)
-
+    # 3. Precision/Recall/F1 Calculation
     print("\n--- Precision, Recall, F1-score (Illustrative) ---")
     print("Using zxcvbn score < 3 as 'weak' (True label).")
-    # For a single P/R/F1, we need a threshold for Markov scores.
-    # Let's pick a threshold, e.g., median of Markov scores for passwords zxcvbn considers weak.
-    # Or, more simply for demo, an arbitrary percentile or mean.
-    # For this demo, let's use the median of all Markov scores as a illustrative threshold.
-    # If markov_score > median_markov_score, predict weak.
-    if len(markov_scores_all_test) > 0:
-        # A simple illustrative threshold: median of scores of passwords zxcvbn deems weak
-        weak_markov_scores = markov_scores_all_test[y_true_labels == True]
-        if len(weak_markov_scores) > 0:
-            illustrative_threshold = np.median(weak_markov_scores)
-        else: # If no weak passwords by zxcvbn, use overall median
-            illustrative_threshold = np.median(markov_scores_all_test)
-            
-        print(f"Illustrative Markov threshold (log-likelihood > this = predicted weak): {illustrative_threshold:.4f}")
-        p, r, f1, _, _ = calculate_prf1(y_true_labels, markov_scores_all_test, illustrative_threshold)
-        print(f"At this threshold: Precision={p:.4f}, Recall={r:.4f}, F1-score={f1:.4f}\n")
-    else:
-        print("Not enough data to calculate P/R/F1.\n")
 
-    print("--- ROC Curve Data Points (FPR, TPR) ---")
-    print("Format: (FalsePositiveRate, TruePositiveRate)")
-    roc_data, pr_data = generate_roc_pr_data(y_true_labels, markov_scores_all_test)
-    if roc_data:
-        for i, point in enumerate(roc_data):
-            print(f"Point {i+1}: ({point[0]:.4f}, {point[1]:.4f})")
-        # AUC calculation (trapezoidal rule)
-        auc = 0.0
-        for i in range(len(roc_data) - 1):
-            auc += (roc_data[i+1][0] - roc_data[i][0]) * (roc_data[i+1][1] + roc_data[i][1]) / 2.0
+    # Determine threshold: median Markov log-likelihood among passwords zxcvbn labeled as weak
+    weak_passwords_markov_scores = []
+    for pwd in training_passwords: # Use training passwords to set threshold, as per typical ML practice
+        if not isinstance(pwd, str): continue
+        z_score, z_weak = get_zxcvbn_details(pwd)
+        if z_weak:
+            weak_passwords_markov_scores.append(markov_model.get_log_likelihood(pwd))
+    
+    if weak_passwords_markov_scores:
+        threshold = np.median(weak_passwords_markov_scores)
+    else: # Fallback if no weak passwords in training by zxcvbn's standard
+        if markov_pred_scores:
+            threshold = np.median(markov_pred_scores) 
+        else:
+            threshold = -30.0 # Arbitrary fallback
+        print("Warning: No passwords labeled as weak by zxcvbn in training set to determine median threshold, using overall median or fallback.")
+
+
+    print(f"Illustrative Markov threshold (log-likelihood > {threshold:.4f} = predicted weak)")
+    
+    if zxcvbn_true_labels_weak and markov_pred_scores:
+        precision, recall, f1 = calculate_classification_metrics(zxcvbn_true_labels_weak, markov_pred_scores, threshold)
+        print(f"At this threshold: Precision={precision:.4f}, Recall={recall:.4f}, F1-score={f1:.4f}")
+    else:
+        print("Not enough data to calculate P/R/F1.")
+
+    # 4. ROC and PR Curve Data
+    print("\n--- ROC Curve Data Points (FPR, TPR) ---")
+    if zxcvbn_true_labels_weak and markov_pred_scores:
+        roc_points, auc, pr_points = get_roc_pr_data(zxcvbn_true_labels_weak, markov_pred_scores)
+        print(roc_points)
         print(f"Illustrative AUC (Trapezoidal Rule): {auc:.4f}")
+        print("\n--- PR Curve Data Points (Recall, Precision) ---")
+        print(pr_points)
     else:
-        print("Not enough data to generate ROC points.")
+        print("Not enough data for ROC/PR curves.")
+
+
+    # 5. Approximate Guess Number Estimation
+    print("\n--- Approximate Guess Rank ---")
+    print("Note: Based on sorting all training + test passwords by Markov log-likelihood.")
+    print("Lower rank (closer to 1) means model finds it weaker/more guessable.")
     
-    print("\n--- PR Curve Data Points (Recall, Precision) ---")
-    print("Format: (Recall, Precision)")
-    if pr_data:
-        for i, point in enumerate(pr_data):
-            print(f"Point {i+1}: ({point[0]:.4f}, {point[1]:.4f})")
+    all_pswds_for_ranking = list(set(training_passwords + test_passwords_eval))
+    # Select a few passwords to show rank for, e.g., the first few from test_passwords_eval
+    passwords_to_get_rank_for = [p for p in test_passwords_eval[:5] if isinstance(p,str)] 
+    
+    if passwords_to_get_rank_for:
+        ranked_list = approximate_guess_rank(markov_model, all_pswds_for_ranking, passwords_to_get_rank_for)
+        print(f"{'Test Password':<28} | {'Approx. Guess Rank':<20} | {'Markov LogLikelihood':<20}")
+        print("-" * 75)
+        for pwd, rank, score in ranked_list:
+            print(f"{pwd:<28} | {rank:<20} | {score:<20.4f}")
+        print(f"Total passwords considered for ranking: {len(all_pswds_for_ranking)}")
     else:
-        print("Not enough data to generate PR points.")
+        print("No passwords selected for rank demonstration.")
 
-    # --- Approximate Guess Rank ---
-    # Use a subset for cleaner output, or all test_passwords_eval
-    approximate_guess_rank(markov_model, passwords_for_training, test_passwords_eval[:5]) # Demo with first 5
 
-    # --- Policy Experiments ---
-    run_policy_experiments(markov_model)
-    
-    print("\n" + "="*70)
+    # 6. Password Policy Experiments
+    print() # newline
+    run_policy_experiments(markov_model, get_zxcvbn_details)
+
+    print("=" * 70)
     print("Demo Finished.")
     print("Reminder: These results are illustrative due to the small training dataset.")
     print("For robust metrics, a large dataset (e.g., RockYou 70k subset) is required.")
-    print("="*70)
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    # Path to your sample passwords file
-    # Ensure this file exists and contains one password per line
-    sample_password_file = "/Users/justin/Desktop/資安期末/sample_passwords.txt" 
+    # IMPORTANT: User should create 'sample_passwords.txt' in the same directory
+    # or update this path to the correct location.
+    sample_password_file = "sample_passwords.txt" 
     run_demo(sample_password_file)
